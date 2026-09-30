@@ -1,7 +1,9 @@
 #include "minemu/boot.h"
+#include "minemu/irq.h"
 #include "minemu/trap.h"
 #include "minemu/trace.h"
 #include "../drivers/uart.h"
+#include "msh.h"
 
 void minemu_kernel_main(const struct minemu_boot_info *boot_info) {
     if ((uintptr_t)boot_info != MINEMU_BOOT_INFO_VADDR ||
@@ -18,6 +20,8 @@ void minemu_kernel_main(const struct minemu_boot_info *boot_info) {
 
     kprintf("hello world\n");
 
-    minemu_trace_event(1);
-    minemu_fail_stop();
+    uart_rx_irq_init();
+    minemu_irq_enable();
+
+    msh_run();
 }

@@ -1,7 +1,11 @@
 #include <stdarg.h>
 #include <stdint.h>
+#include "minemu/irq.h"
 #include "minemu/platform.h"
+#include "../core/irq_table.h"
 #include "uart.h"
+
+/* ---------- output ---------- */
 
 void uart_putc(char c) {
     while (!(MINEMU_UART0->status & MINEMU_UART_STATUS_TX_READY)) {
@@ -80,4 +84,59 @@ void kprintf(const char *fmt, ...) {
         }
     }
     va_end(ap);
+}
+
+/* ---------- input ----------
+ * Ring buffer shared between the IRQ handler (producer) and uart_getc
+ * (consumer). The handler runs with IRQs masked by hardware; the consumer
+ * masks IRQs itself while touching the buffer.
+ * head/tail count up forever; index = count & (SIZE - 1).
+ */
+
+#define RX_BUF_SIZE 64u /* must be a power of two */
+
+static volatile uint8_t rx_buf[RX_BUF_SIZE];
+static volatile uint32_t rx_head;    /* written only by the IRQ handler */
+static volatile uint32_t rx_tail;    /* written only by uart_getc */
+static volatile uint32_t rx_dropped_count;
+
+static void uart_rx_irq_handler(void) {
+    /* Drain everything, or the RX interrupt fires again right after EOI. */
+    while (MINEMU_UART0->status & MINEMU_UART_STATUS_RX_READY) {
+        uint8_t byte = (uint8_t)MINEMU_UART0->rx_data;
+        if (rx_head - rx_tail < RX_BUF_SIZE) {
+            rx_buf[rx_head & (RX_BUF_SIZE - 1)] = byte;
+            rx_head++;
+        } else {
+            rx_dropped_count++;
+        }
+    }
+}
+
+void uart_rx_irq_init(void) {
+    irq_register(MINEMU_IRQ_UART0, uart_rx_irq_handler);
+    MINEMU_UART0->control = MINEMU_UART_CONTROL_RX_IRQ_ENABLE;
+    MINEMU_INTERRUPT->enable =
+        MINEMU_INTERRUPT->enable | (UINT32_C(1) << MINEMU_IRQ_UART0);
+}
+
+int uart_getc(void) {
+    for (;;) {
+        minemu_irq_disable();
+        if (rx_tail != rx_head) {
+            uint8_t c = rx_buf[rx_tail & (RX_BUF_SIZE - 1)];
+            rx_tail++;
+            minemu_irq_enable();
+            return c;
+        }
+        minemu_irq_enable();
+        /* IRQs are open here, so a pending UART interrupt can fill the buffer. */
+    }
+}
+
+uint32_t uart_rx_dropped(void) {
+    minemu_irq_disable();
+    uint32_t n = rx_dropped_count;
+    minemu_irq_enable();
+    return n;
 }
