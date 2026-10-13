@@ -6,7 +6,7 @@ BUILD := build
 KERNEL := $(BUILD)/minimum-kernel.elf
 RUNTIME := $(BUILD)/libminemu_kernel.a
 
-CORE_OBJECT := $(BUILD)/core/main.o $(BUILD)/drivers/uart.o $(BUILD)/core/irq.o $(BUILD)/core/irq_entry.o $(BUILD)/core/msh.o
+CORE_OBJECT := $(BUILD)/core/main.o $(BUILD)/drivers/uart.o $(BUILD)/core/irq.o $(BUILD)/core/irq_entry.o $(BUILD)/core/msh.o $(BUILD)/core/user_entry.o $(BUILD)/core/svc_entry.o
 RUNTIME_OBJECTS := \
 	$(BUILD)/runtime/block.o \
 	$(BUILD)/runtime/exception.o \
