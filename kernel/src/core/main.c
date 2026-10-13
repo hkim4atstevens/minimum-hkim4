@@ -264,7 +264,98 @@ static bool load_user_module(const struct minemu_boot_info *boot_info,
     return true;
 }
 
+/*
+ * Return true if every byte of [addr, addr + len) is in a user page that is
+ * mapped VALID | USER plus the permission bits in `need`.
+ */
+static bool user_range_ok(uint32_t addr, uint32_t len, uint32_t need) {
+    if (len == 0) {
+        return true;
+    }
+    uint32_t last = addr + (len - 1U);
+    if (last < addr) {                       /* wrapped past 0xffffffff */
+        return false;
+    }
+    if (addr < USER_IMAGE_BASE || last >= USER_STACK_TOP) {
+        return false;                        /* outside the user page table */
+    }
+    uint32_t required = MINEMU_PTE_VALID | MINEMU_PTE_USER | need;
+    for (uint32_t page = addr & MINEMU_PTE_PAGE_MASK; page <= last;
+         page += MINEMU_PAGE_SIZE) {
+        uint32_t pte = user_page_table[(page >> 12) & 1023U];
+        if ((pte & required) != required) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int32_t do_ioctl(uint32_t fd, uint32_t request, uint32_t a, uint32_t b) {
+    switch (request) {
+    case MINEMU_IOCTL_UART_WRITE: {
+        if (fd != MINEMU_FD_UART_OUT && fd != MINEMU_FD_UART_DIAG) {
+            return -1;
+        }
+        /* Validate the whole buffer before sending anything. */
+        if (b > MINEMU_IOCTL_MAX_TRANSFER || !user_range_ok(a, b, MINEMU_PTE_READABLE)) {
+            return -1;
+        }
+        const uint8_t *buf = (const uint8_t *)(uintptr_t)a;
+        for (uint32_t i = 0; i < b; i++) {
+            while ((MINEMU_UART0->status & MINEMU_UART_STATUS_TX_READY) == 0) {
+            }
+            MINEMU_UART0->tx_data = buf[i];
+        }
+        return (int32_t)b;
+    }
+    case MINEMU_IOCTL_UART_READ: {
+        if (fd != MINEMU_FD_UART_IN) {
+            return -1;
+        }
+        /* Validate before removing anything from the RX FIFO. */
+        if (b > MINEMU_IOCTL_MAX_TRANSFER || !user_range_ok(a, b, MINEMU_PTE_WRITABLE)) {
+            return -1;
+        }
+        uint8_t *buf = (uint8_t *)(uintptr_t)a;
+        uint32_t got = 0;
+        while (got < b && (MINEMU_UART0->status & MINEMU_UART_STATUS_RX_READY) != 0) {
+            buf[got++] = (uint8_t)MINEMU_UART0->rx_data;
+        }
+        return (int32_t)got;
+    }
+    case MINEMU_IOCTL_RNG_NEXT:
+    case MINEMU_IOCTL_RNG_STATE: {
+        if (fd != MINEMU_FD_RNG) {
+            return -1;
+        }
+        /* Validate before reading DATA, which advances the generator. */
+        if ((a & 3U) != 0 || !user_range_ok(a, 4U, MINEMU_PTE_WRITABLE)) {
+            return -1;
+        }
+        uint32_t value = (request == MINEMU_IOCTL_RNG_NEXT) ? MINEMU_RNG->data
+                                                            : MINEMU_RNG->state;
+        *(uint32_t *)(uintptr_t)a = value;
+        return 0;
+    }
+    case MINEMU_IOCTL_RNG_SEED:
+        if (fd != MINEMU_FD_RNG) {
+            return -1;
+        }
+        MINEMU_RNG->seed = a;
+        return 0;
+    case MINEMU_IOCTL_TRACE_EVENT:
+        if (fd != MINEMU_FD_TRACE) {
+            return -1;
+        }
+        minemu_trace_event(a);
+        return 0;
+    default:
+        return -1;
+    }
+}
+
 struct minemu_trap_frame *minemu_svc_dispatch(struct minemu_trap_frame *frame) {
+    /* Only accept traps from A32 user mode ... */
     uint32_t mode = frame->spsr & CPSR_MODE_MASK;
     if (frame->exception_id != MINEMU_EXCEPTION_SVC || mode != CPSR_MODE_USR ||
         (frame->spsr & CPSR_THUMB) != 0) {
@@ -272,23 +363,18 @@ struct minemu_trap_frame *minemu_svc_dispatch(struct minemu_trap_frame *frame) {
         return frame;
     }
 
-    uint32_t instruction = *(const uint32_t *)(uintptr_t)frame->fault_pc;
-    if (instruction != A32_SVC_ZERO || frame->r[7] != MINEMU_SYSCALL_IOCTL) {
+    /* ... made by exactly `svc #0` from a readable user code page. */
+    if ((frame->fault_pc & 3U) != 0 ||
+        !user_range_ok(frame->fault_pc, 4U, MINEMU_PTE_READABLE) ||
+        *(const uint32_t *)(uintptr_t)frame->fault_pc != A32_SVC_ZERO) {
         frame->r[0] = (uint32_t)-1;
         return frame;
     }
 
-    if (frame->r[0] == MINEMU_FD_UART_OUT && frame->r[1] == MINEMU_IOCTL_UART_WRITE) {
-        const uint8_t *buf = (const uint8_t *)(uintptr_t)frame->r[2];
-        uint32_t count = frame->r[3];
-        for (uint32_t i = 0; i < count; i++) {
-            while ((MINEMU_UART0->status & MINEMU_UART_STATUS_TX_READY) == 0) {
-            }
-            MINEMU_UART0->tx_data = buf[i];
-        }
-        frame->r[0] = count;
+    if (frame->r[7] == MINEMU_SYSCALL_IOCTL) {
+        frame->r[0] = (uint32_t)do_ioctl(frame->r[0], frame->r[1], frame->r[2], frame->r[3]);
     } else {
-        frame->r[0] = (uint32_t)-1;
+        frame->r[0] = (uint32_t)-1;          /* unknown syscall */
     }
     return frame;
 }
