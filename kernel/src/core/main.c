@@ -22,12 +22,22 @@
 #define A32_SVC_ZERO UINT32_C(0xef000000)
 #define TRACE_USER_SYSCALL UINT32_C(0x48454c10)
 
-static uint32_t system_rom_tables[SYSTEM_ROM_TABLE_COUNT][1024]
-    __attribute__((aligned(MINEMU_PAGE_SIZE)));
-static uint32_t user_page_table[1024] __attribute__((aligned(MINEMU_PAGE_SIZE)));
-static uint8_t user_image_pages[MAX_USER_IMAGE_PAGES][MINEMU_PAGE_SIZE]
-    __attribute__((aligned(MINEMU_PAGE_SIZE)));
-static uint8_t user_stack[MINEMU_PAGE_SIZE] __attribute__((aligned(MINEMU_PAGE_SIZE)));
+/*
+ * Page tables, user image pages and the user stack live in otherwise unused
+ * RAM at physical 0x40100000 (reached through the kernel direct map) instead
+ * of in kernel .bss. The bootloader clears .bss one byte at a time, and ~90 KB
+ * of static buffers there made boot too slow for the msh-prompt test.
+ * Every buffer is explicitly zeroed before use by the loader below.
+ */
+#define FRAME_POOL ((uint8_t *)(uintptr_t)(MINEMU_KERNEL_DIRECT_BASE + UINT32_C(0x00100000)))
+#define POOL_PAGE(n) (FRAME_POOL + (n) * MINEMU_PAGE_SIZE)
+
+static uint32_t (*const system_rom_tables)[1024] = (uint32_t (*)[1024])POOL_PAGE(0);
+static uint32_t *const user_page_table = (uint32_t *)POOL_PAGE(SYSTEM_ROM_TABLE_COUNT);
+static uint8_t (*const user_image_pages)[MINEMU_PAGE_SIZE] =
+    (uint8_t (*)[MINEMU_PAGE_SIZE])POOL_PAGE(SYSTEM_ROM_TABLE_COUNT + 1U);
+static uint8_t *const user_stack =
+    POOL_PAGE(SYSTEM_ROM_TABLE_COUNT + 1U + MAX_USER_IMAGE_PAGES);
 static uint32_t user_page_vaddrs[MAX_USER_IMAGE_PAGES];
 static uint32_t user_page_flags[MAX_USER_IMAGE_PAGES];
 static size_t user_page_count;
@@ -210,8 +220,8 @@ static bool load_user_module(const struct minemu_boot_info *boot_info,
     const struct minemu_module_segment *segments =
         (const struct minemu_module_segment *)(image + module->segment_table_offset);
     bool entry_is_executable = false;
-    zero_bytes(user_page_table, sizeof(user_page_table));
-    zero_bytes(user_stack, sizeof(user_stack));
+    zero_bytes(user_page_table, MINEMU_PAGE_SIZE);
+    zero_bytes(user_stack, MINEMU_PAGE_SIZE);
     user_page_count = 0;
 
     for (uint32_t index = 0; index < module->segment_count; ++index) {
